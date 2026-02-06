@@ -1,0 +1,479 @@
+# python.py
+"""
+Enhanced Food Price Inflation Dashboard (EDA + Forecasting)
+Includes:
+- All original visualizations (except the removed average comparison bar chart)
+- Advanced non-visual analytics (ranking, diagnosis, policy engine, risk score)
+- Built-in AI Chat Assistant (offline, rule-based, dataset-aware)
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+from statsmodels.tsa.arima.model import ARIMA
+import warnings
+warnings.filterwarnings("ignore")
+
+st.set_page_config(page_title="Food Price Inflation Dashboard", layout="wide")
+
+# -------------------------------------------------------------
+# Helper Functions
+# -------------------------------------------------------------
+@st.cache_data
+def load_data(path: str):
+    return pd.read_csv(path)
+
+def prepare_df(df):
+    df2 = df.copy()
+    rename_map = {"date": "Year", "country": "Country", "Inflation": "Value"}
+    df2 = df2.rename(columns=rename_map)
+    try:
+        df2["Year"] = pd.to_datetime(df2["Year"], errors="coerce").dt.year
+    except Exception:
+        df2["Year"] = pd.to_numeric(df2["Year"], errors="coerce")
+    df2["Value"] = pd.to_numeric(df2["Value"], errors="coerce")
+    df2["Country"] = df2["Country"].astype(str)
+    return df2.dropna(subset=["Year", "Country", "Value"])
+
+def plot_timeseries(df, theme="plotly"):
+    fig = px.line(df, x="Year", y="Value", color="Country", markers=True,
+                  title="Average Inflation Over Time", template=theme)
+    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                  xanchor="right", x=1))
+    return fig
+
+def correlation_heatmap(df):
+    numeric = df.select_dtypes(include=[np.number])
+    if numeric.shape[1] < 2:
+        st.info("Not enough numeric columns for correlation heatmap.")
+        return
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(numeric.corr(), annot=True, fmt=".2f", cmap="coolwarm", ax=ax)
+    st.pyplot(fig)
+
+def forecast_linear(df, periods=5):
+    agg = df.groupby("Year")["Value"].mean().reset_index().dropna()
+    if agg.shape[0] < 2:
+        return None
+    X = agg["Year"].values.reshape(-1, 1)
+    y = agg["Value"].values
+    model = LinearRegression()
+    model.fit(X, y)
+    future = np.arange(int(agg["Year"].max()) + 1, int(agg["Year"].max()) + 1 + periods)
+    preds = model.predict(future.reshape(-1, 1))
+    return agg, pd.DataFrame({"Year": future, "Predicted": preds})
+
+def forecast_arima(df, periods=5):
+    agg = df.groupby("Year")["Value"].mean().sort_index().dropna()
+    if agg.shape[0] < 3:
+        return None, None
+    model = ARIMA(agg, order=(1, 1, 1)).fit()
+    forecast = model.get_forecast(steps=periods)
+    pred = forecast.predicted_mean
+    conf = forecast.conf_int()
+    future = np.arange(int(agg.index.max()) + 1, int(agg.index.max()) + 1 + periods)
+    pred_df = pd.DataFrame({
+        "Year": future,
+        "Predicted": pred.values,
+        "Lower": conf.iloc[:, 0].values,
+        "Upper": conf.iloc[:, 1].values
+    })
+    return agg.reset_index().rename(columns={"Value": "Observed"}), pred_df
+
+def df_to_bytes(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+# -------------------------------------------------------------
+# App Layout
+# -------------------------------------------------------------
+st.title("📊 Enhanced Food Price Inflation Dashboard")
+
+DEFAULT_PATH = "/mnt/data/WLD_RTFP_country_2025-10-27.csv"
+try:
+    data = load_data(DEFAULT_PATH)
+    st.success(f"Loaded dataset: {DEFAULT_PATH} ({len(data)} rows)")
+except Exception:
+    uploaded = st.file_uploader("Upload your CSV", type=["csv"])
+    if uploaded:
+        data = pd.read_csv(uploaded)
+        st.success(f"Uploaded dataset: {len(data)} rows")
+    else:
+        st.stop()
+
+df = prepare_df(data)
+
+# Sidebar
+st.sidebar.header("Filters & Settings")
+countries = sorted(df["Country"].unique())
+selected_countries = st.sidebar.multiselect("Select Countries", countries, default=countries[:5])
+year_min, year_max = int(df["Year"].min()), int(df["Year"].max())
+year_range = st.sidebar.slider("Select Year Range", year_min, year_max, (max(year_min, year_max - 10), year_max))
+theme = st.sidebar.selectbox("Select Theme", ["plotly", "plotly_dark", "ggplot2", "seaborn"])
+
+mask = df["Country"].isin(selected_countries) & df["Year"].between(year_range[0], year_range[1])
+df_filtered = df[mask]
+if df_filtered.empty:
+    st.warning("No data available for selected filters.")
+    st.stop()
+
+# -------------------------------------------------------------
+# MAIN DASHBOARD
+# -------------------------------------------------------------
+st.header("📈 Inflation Trends Over Time")
+agg = df_filtered.groupby(["Year", "Country"])["Value"].mean().reset_index()
+st.plotly_chart(plot_timeseries(agg, theme=theme), use_container_width=True)
+
+# -------------------------------------------------------------
+# NEW FEATURE 1 — Descriptive Stats
+# -------------------------------------------------------------
+st.header("📊 Descriptive Statistics")
+st.dataframe(df_filtered[["Country", "Value"]].groupby("Country").describe().round(2))
+
+# -------------------------------------------------------------
+# NEW FEATURE 3 — Top & Bottom Years
+# -------------------------------------------------------------
+st.header("📅 Top and Bottom Inflation Years")
+year_avg = df_filtered.groupby("Year")["Value"].mean().reset_index()
+top5 = year_avg.nlargest(5, "Value")
+bottom5 = year_avg.nsmallest(5, "Value")
+col1, col2 = st.columns(2)
+col1.subheader("🔥 Highest Inflation Years")
+col1.dataframe(top5)
+col2.subheader("🧊 Lowest Inflation Years")
+col2.dataframe(bottom5)
+
+# -------------------------------------------------------------
+# NEW FEATURE 4 — Boxplot
+# -------------------------------------------------------------
+st.header("📦 Inflation Distribution by Country")
+fig_box = px.box(df_filtered, x="Country", y="Value", color="Country",
+                 title="Inflation Spread (Boxplot)", template=theme)
+st.plotly_chart(fig_box, use_container_width=True)
+
+# -------------------------------------------------------------
+# NEW FEATURE 5 — Volatility (Std. Dev.)
+# -------------------------------------------------------------
+st.header("🌪️ Inflation Volatility by Country")
+vol = df_filtered.groupby("Country")["Value"].std().reset_index().rename(columns={"Value": "Volatility"})
+fig_vol = px.bar(vol.sort_values("Volatility", ascending=False), x="Country", y="Volatility", color="Volatility",
+                 title="Inflation Volatility (Standard Deviation)", template=theme)
+st.plotly_chart(fig_vol, use_container_width=True)
+
+# -------------------------------------------------------------
+# NEW FEATURE 6 — Year-over-Year Change
+# -------------------------------------------------------------
+st.header("📉 Year-over-Year Inflation Change")
+yoY = df_filtered.groupby("Year")["Value"].mean().pct_change() * 100
+fig_yoy = px.line(x=yoY.index, y=yoY.values, markers=True,
+                  title="Year-over-Year Change in Inflation (%)", labels={"x": "Year", "y": "Change (%)"},
+                  template=theme)
+st.plotly_chart(fig_yoy, use_container_width=True)
+
+# -------------------------------------------------------------
+# Original Features (Key Metrics, Correlation, Map, Forecast, Q&A)
+# -------------------------------------------------------------
+st.header("📊 Key Metrics")
+col1, col2 = st.columns(2)
+avg_value = round(df_filtered["Value"].mean(), 2)
+latest_year = df_filtered["Year"].max()
+latest_avg = round(df_filtered[df_filtered["Year"] == latest_year]["Value"].mean(), 2)
+col1.metric("Average Inflation", avg_value)
+col2.metric(f"Inflation in {latest_year}", latest_avg)
+
+st.header("📉 Correlation Heatmap")
+correlation_heatmap(df_filtered)
+
+st.header("🗺️ Average Inflation by Country")
+geo = df_filtered.groupby("Country")["Value"].mean().reset_index()
+fig_map = px.choropleth(geo, locations="Country", locationmode="country names",
+                        color="Value", hover_name="Country",
+                        title="Average Inflation by Country", template=theme)
+st.plotly_chart(fig_map, use_container_width=True)
+
+st.header("🔮 Forecasting")
+method = st.selectbox("Method", ["Linear Regression", "ARIMA"])
+periods = st.slider("Forecast Horizon (Years)", 1, 10, 3)
+btn = st.button("Run Forecast")
+
+if btn:
+    subset = df_filtered[["Year", "Value"]].dropna()
+    if method == "Linear Regression":
+        res = forecast_linear(subset, periods)
+        if res:
+            obs, pred = res
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=obs["Year"], y=obs["Value"], mode="lines+markers", name="Observed"))
+            fig.add_trace(go.Scatter(x=pred["Year"], y=pred["Predicted"], mode="lines+markers", name="Predicted"))
+            fig.update_layout(title="Linear Regression Forecast", template=theme)
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        obs, pred = forecast_arima(subset, periods)
+        if obs is not None:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=obs["Year"], y=obs["Observed"], mode="lines+markers", name="Observed"))
+            fig.add_trace(go.Scatter(x=pred["Year"], y=pred["Predicted"], mode="lines+markers", name="Predicted"))
+            fig.add_trace(go.Scatter(x=pred["Year"], y=pred["Lower"], mode="lines", name="Lower CI", line=dict(dash="dash")))
+            fig.add_trace(go.Scatter(x=pred["Year"], y=pred["Upper"], mode="lines", name="Upper CI", line=dict(dash="dash")))
+            fig.update_layout(title="ARIMA Forecast", template=theme)
+            st.plotly_chart(fig, use_container_width=True)
+
+# -------------------------------------------------------------
+# NEW UNIQUE FEATURES — Non-visual analytics & recommendations
+# -------------------------------------------------------------
+st.markdown("---")
+st.header("🧩 Advanced Analytical Tools (No additional charts)")
+
+# Feature: Smart Country Ranking System
+st.subheader("🏅 Smart Country Ranking System")
+ranking_df = df_filtered.groupby("Country")["Value"].mean().reset_index()
+# Use qcut if enough countries, else simple bins
+if len(ranking_df) >= 3:
+    ranking_df["Category"] = pd.qcut(ranking_df["Value"],
+                                    q=3,
+                                    labels=["Best (Low Inflation)",
+                                            "Moderate Inflation",
+                                            "Risky (High Inflation)"])
+else:
+    bins = [ranking_df["Value"].min() - 1, ranking_df["Value"].median(), ranking_df["Value"].max() + 1]
+    labels = ["Best (Low Inflation)", "Risky (High Inflation)"]
+    ranking_df["Category"] = pd.cut(ranking_df["Value"], bins=bins, labels=labels[:len(bins)-1])
+st.dataframe(ranking_df.sort_values("Value").reset_index(drop=True))
+
+# Feature: Inflation Diagnosis Assistant (rule-based)
+st.subheader("🧠 Inflation Diagnosis Assistant")
+diag_country = st.selectbox("Select a Country for Smart Insight", selected_countries, index=0 if selected_countries else 0)
+if diag_country:
+    country_series = df_filtered[df_filtered["Country"] == diag_country].groupby("Year")["Value"].mean().reset_index()
+    if country_series.empty:
+        st.info("No data for this country in the selected filters.")
+    else:
+        avg = country_series["Value"].mean()
+        if len(country_series) >= 2:
+            change = country_series["Value"].iloc[-1] - country_series["Value"].iloc[-2]
+        else:
+            change = 0.0
+
+        if avg < 3:
+            suggestion = "✔ Stable — low average inflation; economy appears to maintain food price stability."
+        elif avg < 6:
+            suggestion = "⚠ Moderate — watch for supply/import issues; consider targeted interventions."
+        else:
+            suggestion = "🚨 High Risk — significant inflation; policy measures advised (subsidies, price controls)."
+
+        if change > 1:
+            trend_msg = "recently rising quickly 📈"
+        elif change > 0:
+            trend_msg = "increasing moderately 📈"
+        elif change < -1:
+            trend_msg = "falling rapidly 📉"
+        elif change < 0:
+            trend_msg = "decreasing moderately 📉"
+        else:
+            trend_msg = "stable (no recent large change) ➖"
+
+        st.markdown(f"**{diag_country} — Diagnosis**")
+        st.write(f"- Average Inflation (selected range): **{avg:.2f}%**")
+        st.write(f"- Latest year change: **{change:.2f}%** ({trend_msg})")
+        st.write(f"- Recommendation: {suggestion}")
+
+# Feature: Policy Recommendation Engine
+st.subheader("📌 Policy Recommendation Engine")
+policy_df = df_filtered.groupby("Country")["Value"].agg(["mean", "std"]).reset_index().rename(columns={"mean": "AvgInflation", "std": "Volatility"})
+def recommend_policy(row):
+    if row["AvgInflation"] > 6 and row["Volatility"] > 2:
+        return "High inflation & volatile → Price stabilization, subsidies, import diversification."
+    if row["AvgInflation"] > 6:
+        return "High inflation → Consider subsidies, support domestic supply."
+    if row["Volatility"] > 2:
+        return "High volatility → Strengthen storage, supply chain, and monitoring."
+    return "Low/Moderate → Maintain monitoring; targeted support if needed."
+
+policy_df["Policy Recommendation"] = policy_df.apply(recommend_policy, axis=1)
+st.dataframe(policy_df.sort_values(by=["AvgInflation", "Volatility"], ascending=False).reset_index(drop=True))
+
+# Feature: Economic Risk Score
+st.subheader("🚦 Economic Food Price Risk Score")
+risk_df = policy_df.copy()
+def safe_min_max_scale(series):
+    if series.max() == series.min():
+        return pd.Series([0.5] * len(series), index=series.index)
+    return (series - series.min()) / (series.max() - series.min())
+
+risk_df["norm_mean"] = safe_min_max_scale(risk_df["AvgInflation"])
+risk_df["norm_std"] = safe_min_max_scale(risk_df["Volatility"])
+risk_df["RiskScore"] = (0.7 * risk_df["norm_mean"] + 0.3 * risk_df["norm_std"]) * 100
+def risk_level(score):
+    if score >= 66:
+        return "🔴 High Risk"
+    if score >= 33:
+        return "🟡 Medium Risk"
+    return "🟢 Low Risk"
+risk_df["RiskLevel"] = risk_df["RiskScore"].round(2).apply(risk_level)
+st.dataframe(risk_df[["Country", "AvgInflation", "Volatility", "RiskScore", "RiskLevel"]].sort_values("RiskScore", ascending=False).reset_index(drop=True))
+
+st.markdown(
+    """
+    **How Risk Score is calculated:**  
+    - AvgInflation and Volatility are normalized (0-1), combined with weights (0.7 for avg, 0.3 for volatility), and scaled to 0-100.  
+    - Higher score → greater combined risk from high inflation and instability.
+    """
+)
+
+# -------------------------------------------------------------
+# Built-in AI Chat Assistant (Offline rule-based, dataset-aware)
+# -------------------------------------------------------------
+st.markdown("---")
+st.header("🤖 AI Chat Assistant (Offline)")
+
+# initialize session history
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# quick helpers to query dataset inside the assistant
+def top_countries_by_year(year, n=5):
+    sub = df_filtered[df_filtered["Year"] == year]
+    if sub.empty:
+        return None
+    return sub.groupby("Country")["Value"].mean().sort_values(ascending=False).head(n)
+
+def country_summary(country):
+    sub = df_filtered[df_filtered["Country"] == country]
+    if sub.empty:
+        return None
+    s = sub.groupby("Year")["Value"].mean().reset_index()
+    return {
+        "avg": float(s["Value"].mean()),
+        "latest": float(s["Value"].iloc[-1]),
+        "years": int(s["Year"].nunique()),
+        "trend_change": float(s["Value"].iloc[-1] - s["Value"].iloc[0]) if len(s) > 1 else 0.0
+    }
+
+# rule-based reply generator that uses dataset insights when possible
+def ai_reply(prompt: str) -> str:
+    p = prompt.strip().lower()
+    # direct dataset requests
+    import re
+    year_match = re.search(r"\b(19|20)\d{2}\b", p)
+    country_match = None
+    for c in selected_countries:
+        if c.lower() in p:
+            country_match = c
+            break
+
+    if "top countries" in p or "highest inflation" in p:
+        if year_match:
+            year = int(year_match.group(0))
+            top = top_countries_by_year(year, n=5)
+            if top is None:
+                return f"No data available for year {year} in the current filters."
+            lines = [f"{i+1}. {country}: {val:.2f}%" for i, (country, val) in enumerate(top.items())]
+            return f"Top countries in {year} by inflation:\n" + "\n".join(lines)
+        else:
+            # overall top
+            overall = df_filtered.groupby("Country")["Value"].mean().sort_values(ascending=False).head(5)
+            lines = [f"{i+1}. {c}: {v:.2f}%" for i, (c, v) in enumerate(overall.items())]
+            return "Top countries (average across selected range):\n" + "\n".join(lines)
+
+    if "summary for" in p or "tell me about" in p or "about" in p and country_match:
+        info = country_summary(country_match)
+        if info is None:
+            return f"No data for {country_match} in selected filters."
+        trend = "increasing" if info["trend_change"] > 0 else "decreasing" if info["trend_change"] < 0 else "stable"
+        return (f"{country_match} — Average inflation: {info['avg']:.2f}%. "
+                f"Latest observed: {info['latest']:.2f}%. Trend over selected years: {trend} "
+                f"(change {info['trend_change']:.2f} pts).")
+
+    # forecast related
+    if "forecast" in p or "predict" in p:
+        # give general guideline + suggest using Forecast button
+        return ("I can run a quick Linear/ARIMA forecast using the 'Forecasting' panel above. "
+                "Linear is simple trend-based; ARIMA handles autoregression and differencing. "
+                "Choose the method and horizon (years) and click 'Run Forecast' to see results.")
+
+    # volatility questions
+    if "volatile" in p or "volatility" in p or "unstable" in p:
+        topv = vol.sort_values("Volatility", ascending=False).head(5)
+        lines = [f"{i+1}. {row['Country']}: {row['Volatility']:.2f}" for i, row in topv.reset_index(drop=True).iterrows()]
+        return "Top volatile countries (std dev) in selected filters:\n" + "\n".join(lines)
+
+    # policy / recommendation
+    if "what should" in p or "recommend" in p or "policy" in p:
+        return ("Policy suggestions depend on whether inflation is high and/or volatile. "
+                "If both are high: price stabilization, targeted subsidies, import diversification, and strengthening supply chains. "
+                "If average inflation is high but volatility is low: long-term supply & production support. "
+                "Use the Policy Recommendation Engine section for automated suggestions by country.")
+
+    # data help
+    if "how many countries" in p or "records" in p:
+        return f"Filtered dataset contains {len(df_filtered)} records across {df_filtered['Country'].nunique()} countries and years {int(df_filtered['Year'].min())}–{int(df_filtered['Year'].max())}."
+
+    # fallback generic answers
+    if "inflation" in p:
+        return ("Inflation in food prices can be driven by supply shocks (weather, pests), "
+                "input costs (fuel, fertilizer), currency depreciation (imported foods), "
+                "and demand pressures. Volatility suggests instability in supply chains or policy uncertainty.")
+
+    # If country name mentioned alone
+    if country_match:
+        info = country_summary(country_match)
+        if info:
+            return (f"{country_match}: avg {info['avg']:.2f}%, latest {info['latest']:.2f}%, "
+                    f"{info['years']} years in selection, net change {info['trend_change']:.2f} pts.")
+
+    # very short fallback
+    return "I can help with dataset summaries, top countries for a year, volatility lists, basic policy guidance, and forecasting guidance. Try: 'Top countries in 2020', 'Summary for India', or 'Which countries are most volatile?'"
+
+# chat UI
+with st.container():
+    user_input = st.text_input("Type a question for the assistant (e.g., 'Top countries in 2020', 'Summary for India')", key="chat_input")
+    submit = st.button("Send", key="send_button")
+    if submit and user_input:
+        reply = ai_reply(user_input)
+        st.session_state.chat_history.append(("You", user_input))
+        st.session_state.chat_history.append(("Assistant", reply))
+    # render history
+    if st.session_state.chat_history:
+        for speaker, text in st.session_state.chat_history[-12:]:  # show last 12 messages
+            if speaker == "You":
+                st.markdown(f"**You:** {text}")
+            else:
+                st.markdown(f"**Assistant:** {text}")
+
+st.markdown("---")
+
+# -------------------------------------------------------------
+# Download
+# -------------------------------------------------------------
+st.header("📥 Download Filtered Data")
+st.download_button("Download Filtered Data (CSV)", data=df_to_bytes(df_filtered),
+                   file_name="filtered_data.csv", mime="text/csv")
+
+# -------------------------------------------------------------
+# Quick Insights
+# -------------------------------------------------------------
+st.markdown("---")
+st.header("💬 Quick Insights")
+try:
+    highest_vol_country = vol.loc[vol['Volatility'].idxmax(), 'Country']
+except Exception:
+    highest_vol_country = "N/A"
+try:
+    peak_year = int(top5.iloc[0]['Year'])
+except Exception:
+    peak_year = "N/A"
+
+auto_summary = f"""
+- The average inflation across selected countries is **{avg_value}%**.  
+- The latest year's inflation ({latest_year}) is **{latest_avg}%**.  
+- Country with highest volatility: **{highest_vol_country}**.  
+- Year with peak inflation: **{peak_year}**.
+"""
+st.info(auto_summary)
+
+st.markdown("---")
+st.success("Dashboard loaded with advanced analytics & built-in offline AI assistant ✅")
